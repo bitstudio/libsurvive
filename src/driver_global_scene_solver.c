@@ -150,6 +150,10 @@ static size_t add_scenes(struct global_scene_solver *gss, SurviveObject *so) {
 			SV_VERBOSE(100, "Scene %s %d for lh %d", survive_colorize_codename(so), (int)lh_meas[i], i);
 		}
 	} else {
+		/* Compaction treats a non-null object as an accepted scene. Do not
+		 * let this rejected staging slot become a calibration seed on the
+		 * next attempt, even when it gains no additional measurements. */
+		scene->so = NULL;
 		SV_VERBOSE(100, "Scene rejected; meas %d", (int)scene->meas_cnt);
 	}
 
@@ -172,14 +176,14 @@ static bool run_optimization(global_scene_solver *gss) {
 	if(success) {
 		if(gss->auto_floor) {
 			FLT min_z = gss->ctx->floor_offset;
-			for (int i = 0; i < gss->scenes_cnt; i++) {
+			for (int i = 0; i < pgss.scenes_cnt; i++) {
 				min_z = linmath_min(min_z, gss->scenes[i].pose.Pos[2]);
 			}
 			if (isfinite(min_z))
 				survive_set_floor_offset(gss->ctx, min_z);
 		}
 
-		for (int i = 0; i < gss->scenes_cnt; i++) {
+		for (int i = 0; i < pgss.scenes_cnt; i++) {
 			SurvivePose p = gss->scenes[i].pose;
 
 			if (!quatiszero(p.Rot)) {
@@ -260,7 +264,11 @@ static size_t check_object(global_scene_solver *gss, int i, SurviveObject *so) {
 					   so->codename, survive_run_time(ctx),
 					   SurviveSensorActivations_stationary_time(&so->activations) / 48000000.);
 		}
-		gss->last_capture_time[i] = so->activations.last_light_change;
+		/* A rejected sparse scene must not latch out the stationary tracker.
+		 * More sweeps can arrive without changing last_light_change. Retry a
+		 * rejected snapshot after the existing three-second spacing, while a
+		 * successful capture still waits for an actual optical scene change. */
+		gss->last_capture_time[i] = new_scenes ? so->activations.last_light_change : last_event_time;
 	}
 
 	if (scenes_added) {

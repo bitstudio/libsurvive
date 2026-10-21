@@ -1818,7 +1818,7 @@ static bool read_imu_data(SurviveObject *w, uint64_t time_in_us, uint16_t time, 
 	uint8_t *payloadPtr = *readPtr;
 
 	SurviveContext *ctx = w->ctx;
-	if (payloadEndPtr - payloadPtr < 7) {
+	if (payloadEndPtr - payloadPtr < 13) {
 		return false;
 	}
 
@@ -2251,6 +2251,7 @@ static bool handle_input(SurviveObject *w, uint8_t flags, uint8_t **payloadPtr, 
 		SV_VERBOSE(150, "handle_input flags %d %d %d", flagButton, flagTrigger, flagMotion);
 	} else {
 		// Second gen event (Eg Knuckles proximity)
+		VERIFY_LENGTH_OR_FAIL(*payloadPtr, 1);
 		uint8_t genTwoType =
 			POP_BYTE(*payloadPtr); // May be flags, but currently only observed to be 'a1' when knuckles
 
@@ -2312,6 +2313,10 @@ static void handle_watchman_v2(SurviveObject *w, uint64_t time_in_us, uint16_t t
 		return;
 	}
 
+	if (payloadPtr >= payloadEndPtr) {
+		SV_WARN("Decoder fault: empty Watchman v2 packet");
+		return;
+	}
 	uint8_t flags = POP_BYTE(payloadPtr);
 	bool has_errors = false;
 
@@ -2368,12 +2373,51 @@ static void handle_watchman_v2(SurviveObject *w, uint64_t time_in_us, uint16_t t
 	bool flagMetaData = HAS_FLAG(flags, 0x40);
 	bool flagIMU = HAS_FLAG(flags, 0x80);
 
+	// A gen2 mode switch can leave queued raw0 packets. Discard the entire
+	// existing transition window before interpreting IMU, metadata or input;
+	// those fields can belong to the old protocol too. Other generations keep
+	// their original light-only transition handling below.
+	if (ctx->lh_version == 1) {
+		if (driverInfo->packetsSeenWaitingForV2 > 200) {
+			driverInfo->packetsSeenWaitingForV2 = 0;
+			driverInfo->timeWithoutFlag = 0;
+		}
+		if (driverInfo->timeWithoutFlag > 0 && driverInfo->timeWithoutFlag < 20) {
+			driverInfo->packetsSeenWaitingForV2++;
+			if (flagLightcap)
+				driverInfo->timeWithoutFlag = 1;
+			else
+				driverInfo->timeWithoutFlag++;
+			SV_VERBOSE(200, "Discard gen2 transition %s %lu: '%s'", w->codename,
+					   driverInfo->timeWithoutFlag, packetToHex(originPayloadPtr, payloadEndPtr));
+			return;
+		}
+	}
 	if (HAS_FLAG(flags, ~0xD1)) {
 		SV_VERBOSE(100, "%s Unknown flag %02x", w->codename, flags);
 	}
 
-	if (flagIMU)
-		read_imu_data(w, time_in_us, time, &payloadPtr, payloadEndPtr);
+	// Validate fixed sections before publishing any sensor callback. A tracker
+	// reverting to raw0 can send a 14-byte e8 IMU packet: in v2 its flags also
+	// claim metadata/input, which do not exist in that payload.
+	int imuLength = flagIMU ? 13 : 0;
+	VERIFY_LENGTH_OR_FAIL(payloadPtr, imuLength);
+	uint8_t *afterIMU = payloadPtr + imuLength;
+	int metadataLength = 0;
+	if (flagMetaData) {
+		VERIFY_LENGTH_OR_FAIL(afterIMU, 1);
+		if (*afterIMU != 0x80 && *afterIMU != 0x20 && *afterIMU != 0x30) {
+			SV_WARN("Decoder fault: unknown Watchman v2 metadata marker %02x", *afterIMU);
+			return;
+		}
+		metadataLength = *afterIMU == 0x30 ? 3 : 2;
+		VERIFY_LENGTH_OR_FAIL(afterIMU, metadataLength);
+	}
+	if (flagInput) {
+		VERIFY_LENGTH_OR_FAIL(afterIMU + metadataLength, 1);
+	}
+	if (flagIMU && !read_imu_data(w, time_in_us, time, &payloadPtr, payloadEndPtr))
+		goto exit_failure;
 
 	// These things happen every 10 seconds
 	if (flagMetaData) {
@@ -2413,12 +2457,12 @@ static void handle_watchman_v2(SurviveObject *w, uint64_t time_in_us, uint16_t t
 		has_errors = !handle_input(w, input_flags, &payloadPtr, payloadEndPtr);
 	}
 
-	if (driverInfo->packetsSeenWaitingForV2 > 200) {
+	if (ctx->lh_version != 1 && driverInfo->packetsSeenWaitingForV2 > 200) {
 		driverInfo->packetsSeenWaitingForV2 = 0;
 		driverInfo->timeWithoutFlag = 0;
 	}
 
-	if (driverInfo->timeWithoutFlag > 0 && driverInfo->timeWithoutFlag < 20) {
+	if (ctx->lh_version != 1 && driverInfo->timeWithoutFlag > 0 && driverInfo->timeWithoutFlag < 20) {
 		driverInfo->packetsSeenWaitingForV2++;
 		if (flagLightcap) {
 			driverInfo->timeWithoutFlag = 1;
@@ -2455,6 +2499,7 @@ static void handle_watchman_v2(SurviveObject *w, uint64_t time_in_us, uint16_t t
 	}
 
 exit_failure:
+	SV_WARN("Decoder fault: malformed Watchman v2 packet");
 	survive_dump_buffer(ctx, originPayloadPtr, payloadEndPtr - originPayloadPtr);
 }
 

@@ -96,6 +96,7 @@ typedef struct SurviveKalmanTracker {
 	cnkalman_meas_model_t obs_model, lightcap_model, imu_model, zvu_model, joint_model;
 
 	const char* datalog_tag;
+	size_t reinit_count;
 
 	struct {
 		uint32_t late_imu_dropped;
@@ -105,6 +106,9 @@ typedef struct SurviveKalmanTracker {
 		size_t imu_count;
 		FLT lightcap_total_error;
 		size_t lightcap_count;
+		size_t lightcap_accepted_count, lightcap_rejected_count, lightcap_sparse_accepted_count;
+		size_t optical_accepted_count;
+		size_t lightcap_accepted_by_lh[NUM_GEN2_LIGHTHOUSES];
 
 		FLT lightcap_error_by_lh[NUM_GEN2_LIGHTHOUSES];
 		size_t lightcap_count_by_lh[NUM_GEN2_LIGHTHOUSES];

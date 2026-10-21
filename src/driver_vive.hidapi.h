@@ -18,6 +18,7 @@ typedef struct survive_usb_transfer_t {
 	uint8_t *buffer;
 	int status;
 	bool processed;
+	bool error_reported;
 	size_t length;
 	size_t actual_length;
 	uint32_t timeout;
@@ -30,6 +31,7 @@ static inline void survive_usb_transfer_free(survive_usb_transfer_t *tx) { free(
 static inline void survive_usb_transfer_cancel(survive_usb_transfer_t *tx) {}
 static inline int survive_usb_transfer_submit(survive_usb_transfer_t *tx) {
 	int rtn = 0;
+	uint8_t report_id = tx->buffer[0];
 	// char tmp[64];
 	// while (hid_read_timeout(tx->dev->handle->interfaces[0], tmp, sizeof(tmp), 0) > 0) {}
 
@@ -46,9 +48,19 @@ static inline int survive_usb_transfer_submit(survive_usb_transfer_t *tx) {
 
 	tx->processed = false;
 	if (rtn > 0) {
+		tx->error_reported = false;
 		tx->status = LIBUSB_TRANSFER_COMPLETED;
 		tx->length = rtn;
 	} else if (rtn == -1) {
+		if (!tx->error_reported && tx->dev->so) {
+			SurviveContext *ctx = tx->dev->so->ctx;
+			const wchar_t *error = hid_error(tx->dev->handle->interfaces[0]);
+			SV_WARN("USB feature request failed for %s (%s report 0x%02x): %ls",
+					tx->dev->so->codename,
+					tx->type == survive_usb_transfer_type_read_feature_report ? "read" : "write",
+					report_id, error ? error : L"no HID error detail");
+			tx->error_reported = true;
+		}
 		tx->status = -2;
 	} else {
 		tx->status = LIBUSB_TRANSFER_TIMED_OUT;

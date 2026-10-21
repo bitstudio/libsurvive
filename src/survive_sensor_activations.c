@@ -23,7 +23,8 @@ END_STRUCT_CONFIG_SECTION(SurviveSensorActivations)
 
 bool SurviveSensorActivations_is_reading_valid(const SurviveSensorActivations *self, survive_long_timecode tolerance,
 											   uint32_t sensor_idx, int lh, int axis) {
-	return SurviveSensorActivations_time_since_last_reading(self, sensor_idx, lh, axis) <= tolerance;
+	survive_long_timecode age = SurviveSensorActivations_time_since_last_reading(self, sensor_idx, lh, axis);
+	return age != UINT64_MAX && age <= tolerance;
 }
 
 survive_long_timecode SurviveSensorActivations_last_reading(const SurviveSensorActivations *self, uint32_t sensor_idx,
@@ -32,7 +33,7 @@ survive_long_timecode SurviveSensorActivations_last_reading(const SurviveSensorA
 	if (self->lh_gen != 1 && lh < 2 && self->lengths[sensor_idx][lh][axis] == 0)
 		return UINT64_MAX;
 
-	if (isnan(self->angles[sensor_idx][lh][axis]))
+	if (!isfinite(self->angles[sensor_idx][lh][axis]))
 		return UINT64_MAX;
 
 	return data_timecode[axis];
@@ -43,8 +44,9 @@ survive_long_timecode SurviveSensorActivations_time_since_last_reading(const Sur
 	survive_long_timecode last_reading = SurviveSensorActivations_last_reading(self, sensor_idx, lh, axis);
 	survive_long_timecode timecode_now = self->last_light;
 
-	if (last_reading > timecode_now)
-		return UINT32_MAX;
+	/* Invalid readings must never become valid as a 64-bit stationary window grows. */
+	if (last_reading == UINT64_MAX || last_reading > timecode_now)
+		return UINT64_MAX;
 
 	return timecode_now - last_reading;
 }

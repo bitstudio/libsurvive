@@ -348,7 +348,10 @@ FLT cnkalman_run_iterations(cnkalman_meas_model_t *mk, const struct CnMat *Z, co
     }
     if (stop_reason == cnkalman_update_extended_termination_reason_none)
         stop_reason = cnkalman_update_extended_termination_reason_maxiter;
-    bool isFailure = current_norm > initial_norm || isinf(current_norm);
+    /* A residual gate can stop before a Kalman gain is calculated. Do not
+     * return success or let the caller apply a covariance correction then. */
+    bool isFailure = stop_reason == cnkalman_update_extended_termination_reason_too_high_error ||
+                     current_norm > initial_norm || !isfinite(current_norm);
     if (stats) {
         stats->besterror = cnNorm(&y);
         stats->iterations = iter;

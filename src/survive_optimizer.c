@@ -1385,7 +1385,7 @@ int survive_optimizer_run(survive_optimizer *optimizer, struct mp_result_struct 
 				for(;cidx < idx;cidx++)
 					cnMatrixSet(&G, cidx, cidx - z, 1);
 
-				gen_axisangle2quat_jac_axis_angle(Gp.data, params + idx);
+				gen_axisangle2quat_jac_axis_angle(Gp.data, params + quat_idxs[z]);
 				for (int i = 0; i < 4; i++) {
 					for (int j = 0; j < 3; j++) {
 						cnMatrixSet(&G, i + cidx, j + cidx - z, cnMatrixGet(&Gp, i, j));

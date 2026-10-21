@@ -30,6 +30,29 @@ static void ootx_error_clbk_d(ootx_decoder_context *ct, const char *msg) {
 }
 
 STATIC_CONFIG_ITEM(SERIALIZE_OOTX, "serialize-ootx", 'b', "Serialize out ootx", 0)
+STATIC_CONFIG_ITEM(OOTX_UP_TOLERANCE, "ootx-up-tolerance-deg", 'f', "Saved station gravity direction tolerance in degrees", 0.5)
+
+static bool ootx_room_up_changed(SurviveContext *ctx, BaseStationData *b, const FLT *accel) {
+	char key[64];
+	snprintf(key, sizeof(key), "room-tilt-blocked-%08x", (unsigned)b->BaseStationID);
+	/* A moved station stays blocked, including across reconnects. Only a new
+	 * explicit room fit may clear this latch; returning inside tolerance cannot. */
+	if (survive_configf(ctx, key, SC_GET, 0) > 0) return true;
+	FLT tolerance = survive_configf(ctx, OOTX_UP_TOLERANCE_TAG, SC_GET, 0.5);
+	if (!isfinite(tolerance) || tolerance < 0 || tolerance > 180) tolerance = 0.5;
+	FLT a = norm3d(b->accel), n = norm3d(accel), angle = 180;
+	if (isfinite(a) && isfinite(n) && a > 0 && n > 0) {
+		FLT cosine = 0;
+		for (int i = 0; i < 3; i++) cosine += (b->accel[i] / a) * (accel[i] / n);
+		angle = acos(fmax(-1, fmin(1, cosine))) * 180 / acos(-1);
+	}
+	if (isfinite(a) && isfinite(n) && a > 0 && n > 0 && angle <= tolerance + 1e-9) return false;
+	survive_configf(ctx, key, SC_SETCONFIG | SC_OVERRIDE, angle);
+	SV_WARN("Station tilt exceeded: station=%08x change=%.6f tolerance=%.6f; saved room pose blocked",
+		(unsigned)b->BaseStationID, (double)angle, (double)tolerance);
+	return true;
+}
+
 static void ootx_packet_clbk_d_gen2(ootx_decoder_context *ct, ootx_packet *packet) {
 	SurviveContext *ctx = ((SurviveObject *)(ct->user))->ctx;
 	int id = ct->user1;
@@ -48,7 +71,10 @@ static void ootx_packet_clbk_d_gen2(ootx_decoder_context *ct, ootx_packet *packe
 	BaseStationData *b = &ctx->bsd[id];
 	b->OOTXChecked |= true;
 	FLT accel[3] = {v15.accel_dir[0], v15.accel_dir[1], v15.accel_dir[2]};
-	bool upChanged = norm3d(b->accel) != 0.0 && dist3d(b->accel, accel) > 1e-3;
+	bool roomFixed = survive_configi(ctx, "disable-calibrate", SC_GET, 0) &&
+		b->OOTXSet && b->BaseStationID == v15.id;
+	bool upChanged = roomFixed ? ootx_room_up_changed(ctx, b, accel) :
+		norm3d(b->accel) != 0.0 && dist3d(b->accel, accel) > 1e-3;
 
 	if (upChanged) {
 		SV_VERBOSE(10, "OOTX up direction changed for %x (%f)", b->BaseStationID, norm3d(b->accel));
@@ -70,9 +96,9 @@ static void ootx_packet_clbk_d_gen2(ootx_decoder_context *ct, ootx_packet *packe
 			b->fcal[i].ogeemag = v15.fcal_ogeemag[i];
 		}
 
-		for (int i = 0; i < 3; i++) {
-			b->accel[i] = v15.accel_dir[i];
-		}
+		/* Keep the original reference in fixed-room mode, even when blocked.
+		 * Updating it would let a sequence of small tilts evade the tolerance. */
+		if (!roomFixed) for (int i = 0; i < 3; i++) b->accel[i] = v15.accel_dir[i];
 		b->sys_unlock_count = v15.sys_unlock_count;
 
 		// Although we know this already....
@@ -274,6 +300,8 @@ SURVIVE_EXPORT void survive_default_sync_process(SurviveObject *so, survive_chan
 }
 
 static inline int8_t determine_plane(SurviveObject *so, int8_t bsd_idx, FLT angle) {
+	if (!isfinite(angle))
+		return -1;
 	static int naive_plane_only = -1;
 	if (naive_plane_only == -1)
 		naive_plane_only = survive_configi(so->ctx, "naive-plane-only", SC_GET, 0);
@@ -300,6 +328,21 @@ static inline int8_t determine_plane(SurviveObject *so, int8_t bsd_idx, FLT angl
 
 		if (err[0] <= .1 || err[1] <= .1) {
 			plane = err[1] < err[0];
+		}
+
+		/* Bootstrap at the pi seam cannot learn a missing plane's centre by
+		 * rejecting every hit. A current, well-supported complementary plane
+		 * rules out one identity; do not guess when neither/both are observed,
+		 * and leave established tracking's ambiguity policy unchanged. */
+		if (plane == -1 && !so->ctx->bsd[bsd_idx].PositionSet && so->timebase_hz > 0 &&
+			SurviveSensorActivations_stationary_time(&so->activations) > (survive_long_timecode)so->timebase_hz) {
+			for (int missing = 0; missing < 2; missing++) {
+				int known = 1 - missing;
+				if (so->activations.angles_center_cnt[bsd_idx][missing] == 0 &&
+					so->activations.angles_center_cnt[bsd_idx][known] >= 4 &&
+					isfinite(so->activations.angles_center_x[bsd_idx][known]) && err[known] > .1)
+					plane = missing;
+			}
 		}
 
 		if (plane != -1 && naive_plane != plane) {

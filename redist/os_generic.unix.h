@@ -144,6 +144,76 @@ OSG_INLINE void OGDeleteMutex(og_mutex_t om) {
 	free(om);
 }
 
+#ifdef __APPLE__
+/* Darwin does not implement unnamed POSIX semaphores.  Keep the counted,
+ * initially locked contract, including cross-thread wait/post and cancellation.
+ * As with sem_destroy, callers must finish/join users before deleting it. */
+struct og_apple_semaphore {
+	pthread_mutex_t mutex;
+	pthread_cond_t condition;
+	int count;
+};
+
+OSG_INLINE og_sema_t OGCreateSema() {
+	struct og_apple_semaphore *sem = (struct og_apple_semaphore *)malloc(sizeof(*sem));
+	_OGHandlePosixError("OGCreateSema allocation", sem ? 0 : ENOMEM);
+	int err = pthread_mutex_init(&sem->mutex, NULL);
+	if (err) {
+		free(sem);
+		_OGHandlePosixError("OGCreateSema mutex", err);
+	}
+	err = pthread_cond_init(&sem->condition, NULL);
+	if (err) {
+		pthread_mutex_destroy(&sem->mutex);
+		free(sem);
+		_OGHandlePosixError("OGCreateSema condition", err);
+	}
+	sem->count = 0;
+	return (og_sema_t)sem;
+}
+
+OSG_INLINE int OGGetSema(og_sema_t os) {
+	struct og_apple_semaphore *sem = (struct og_apple_semaphore *)os;
+	_OGHandlePosixError("OGGetSema lock", pthread_mutex_lock(&sem->mutex));
+	int count = sem->count;
+	_OGHandlePosixError("OGGetSema unlock", pthread_mutex_unlock(&sem->mutex));
+	return count;
+}
+
+static inline void og_apple_semaphore_unlock(void *os) {
+	struct og_apple_semaphore *sem = (struct og_apple_semaphore *)os;
+	_OGHandlePosixError("OGLockSema unlock", pthread_mutex_unlock(&sem->mutex));
+}
+
+OSG_INLINE void OGLockSema(og_sema_t os) {
+	struct og_apple_semaphore *sem = (struct og_apple_semaphore *)os;
+	pthread_testcancel();
+	_OGHandlePosixError("OGLockSema lock", pthread_mutex_lock(&sem->mutex));
+	/* Deferred cancellation from cond_wait reacquires the mutex first. */
+	pthread_cleanup_push(og_apple_semaphore_unlock, sem);
+	while (sem->count == 0)
+		_OGHandlePosixError("OGLockSema wait", pthread_cond_wait(&sem->condition, &sem->mutex));
+	sem->count--;
+	pthread_cleanup_pop(1);
+}
+
+OSG_INLINE void OGUnlockSema(og_sema_t os) {
+	struct og_apple_semaphore *sem = (struct og_apple_semaphore *)os;
+	_OGHandlePosixError("OGUnlockSema lock", pthread_mutex_lock(&sem->mutex));
+	/* The public os_generic.h contract sets the maximum count to 32767. */
+	_OGHandlePosixError("OGUnlockSema count", sem->count == 32767 ? EOVERFLOW : 0);
+	sem->count++;
+	_OGHandlePosixError("OGUnlockSema signal", pthread_cond_signal(&sem->condition));
+	_OGHandlePosixError("OGUnlockSema unlock", pthread_mutex_unlock(&sem->mutex));
+}
+
+OSG_INLINE void OGDeleteSema(og_sema_t os) {
+	struct og_apple_semaphore *sem = (struct og_apple_semaphore *)os;
+	_OGHandlePosixError("OGDeleteSema condition", pthread_cond_destroy(&sem->condition));
+	_OGHandlePosixError("OGDeleteSema mutex", pthread_mutex_destroy(&sem->mutex));
+	free(sem);
+}
+#else
 OSG_INLINE og_sema_t OGCreateSema() {
 	sem_t *sem = (sem_t *)malloc(sizeof(sem_t));
 	sem_init(sem, 0, 0);
@@ -164,6 +234,8 @@ OSG_INLINE void OGDeleteSema(og_sema_t os) {
 	sem_destroy((sem_t *)os);
 	free(os);
 }
+
+#endif
 
 OSG_INLINE void OGSignalCond(og_cv_t cv) {
 	_OGHandlePosixError("OGSignalCond", pthread_cond_signal((pthread_cond_t *)cv));

@@ -8,6 +8,7 @@
 #include <cnkalman/kalman.h>
 
 #include <assert.h>
+#include <float.h>
 #if !defined(__FreeBSD__) && !defined(__APPLE__)
 #include <malloc.h>
 #endif
@@ -369,6 +370,40 @@ int sort_by_lh_axis_sensor(const void * _info1, const void * _info2) {
 }
 
 
+static bool record_lightcap_result(SurviveKalmanTracker *tracker, FLT error, int measurements) {
+	/* Attempted updates can fail the iterative model. They must not renew
+	 * optical freshness or masquerade as accepted sparse constraints. */
+	if (!isfinite(error) || error < 0) {
+		tracker->stats.lightcap_rejected_count++;
+		return false;
+	}
+	tracker->stats.lightcap_accepted_count++;
+	/* A batch can contain unpaired planes and multiple stations. Count only
+	 * stations whose measurements participated in this accepted correction,
+	 * once per station; rejected batches above never renew their freshness. */
+	uint32_t stations = 0;
+	for (int i = 0; i < measurements; i++) {
+		int lh = tracker->savedLight[tracker->savedLight_idx + i].lh;
+		if (lh >= 0 && lh < NUM_GEN2_LIGHTHOUSES) stations |= (uint32_t)1 << lh;
+	}
+	for (int lh = 0; lh < NUM_GEN2_LIGHTHOUSES; lh++)
+		if (stations & ((uint32_t)1 << lh)) tracker->stats.lightcap_accepted_by_lh[lh]++;
+	if (measurements < 5) tracker->stats.lightcap_sparse_accepted_count++;
+	return true;
+}
+
+static void record_optical_result(SurviveKalmanTracker *tracker, FLT error, PoserType type) {
+	if (!isfinite(error) || error < 0) return;
+	switch (type) {
+	case POSERDATA_LIGHT: case POSERDATA_LIGHT_GEN2:
+	case POSERDATA_SYNC: case POSERDATA_SYNC_GEN2:
+	case POSERDATA_GLOBAL_SCENES:
+		tracker->stats.optical_accepted_count++;
+		break;
+	default: break; /* KalmanOnly's IMU bootstrap is not an optical solution. */
+	}
+}
+
 void survive_kalman_tracker_integrate_saved_light(SurviveKalmanTracker *tracker, PoserData *pd) {
 	SurviveContext *ctx = tracker->so->ctx;
 	FLT time = pd->timecode / (FLT)tracker->so->timebase_hz;
@@ -386,6 +421,8 @@ void survive_kalman_tracker_integrate_saved_light(SurviveKalmanTracker *tracker,
 	if (tracker->light_required_obs > tracker->stats.obs_count) {
 		return;
 	}
+	/* Sparse continuation requires a genuine optical seed, not IMU bootstrap. */
+	if (tracker->lightcap_min_sensor_cnt < 5 && !tracker->stats.optical_accepted_count) return;
 
 	if (tracker->light_var >= 0) {
 		for (int i = 0; i < tracker->savedLight_idx; i++) {
@@ -406,6 +443,7 @@ void survive_kalman_tracker_integrate_saved_light(SurviveKalmanTracker *tracker,
 		}
 
 		FLT rtn = 0;
+		bool accepted = false;
 		while(tracker->savedLight_idx > 0) {
 			int lh = tracker->savedLight[tracker->savedLight_idx-1].lh;
 			int cnt = 0;
@@ -460,21 +498,26 @@ void survive_kalman_tracker_integrate_saved_light(SurviveKalmanTracker *tracker,
 			FLT lh_trace = cn_trace(&ctx->bsd[lh].tracker->model.P);
 			FLT ratio = lh_trace / obj_trace;
 
-			tracker->last_light_time = time;
-
+			FLT error;
 			if(useJointModel && tracker->joint_lightcap_ratio < ratio) {
 				tracker->joint_model.ks[0] = &ctx->bsd[lh].tracker->model;
 				tracker->joint_model.ks[1] = &ctx->bsd[lh].tracker->bsd_model;
-				rtn += cnkalman_meas_model_predict_update(time, &tracker->joint_model, &cbctx, &Z, &R);
+				error = cnkalman_meas_model_predict_update(time, &tracker->joint_model, &cbctx, &Z, &R);
 				tracker->stats.joint_model_sensor_cnt_sum += cnt;
 				survive_kalman_lighthouse_report(ctx->bsd[lh].tracker);
 			} else {
-				rtn += cnkalman_meas_model_predict_update(time, &tracker->lightcap_model, &cbctx, &Z, &R);
+				error = cnkalman_meas_model_predict_update(time, &tracker->lightcap_model, &cbctx, &Z, &R);
 				tracker->stats.lightcap_model_sensor_cnt_sum += cnt;
+			}
+			if (record_lightcap_result(tracker, error, cnt)) {
+				accepted = true;
+				rtn += error;
+				tracker->last_light_time = time;
 			}
 		}
 
 		tracker->datalog_tag = 0;
+		if (!accepted) return;
 		tracker->stats.lightcap_total_error += rtn;
 
 		tracker->light_residuals_all *= .9;
@@ -1155,10 +1198,68 @@ void survive_show_covariance(SurviveObject *so, const SurvivePose *pose, const s
     }
 }
 
+/* This interface consumes unit-quaternion poses, not arbitrary scaled vectors.
+ * Refuse malformed data before learning variance, raw hooks or state mutation.
+ * The unit tolerance is floating-point roundoff, not an innovation/noise gate.
+ * Covariance confidence/PSD admission remains the native caller's policy. */
+static bool pose_observation_valid(const SurvivePose *pose, const CnMat *R) {
+	if (!pose) return false;
+	for (int i = 0; i < 7; i++) if (!isfinite(((const FLT *)pose)[i])) return false;
+	FLT norm2 = 0;
+	for (int i = 0; i < 4; i++) norm2 += pose->Rot[i] * pose->Rot[i];
+	FLT epsilon = sizeof(FLT) == sizeof(float) ? FLT_EPSILON : DBL_EPSILON;
+	if (!isfinite(norm2) || fabs(norm2 - 1) > 64 * epsilon) return false;
+	if (R) {
+		if (!R->data || R->rows != 7 || R->cols != 7 || R->step < 7) return false;
+		for (int r = 0; r < 7; r++) for (int c = 0; c < 7; c++)
+			if (!isfinite(cnMatrixGet(R, r, c))) return false;
+	}
+	return true;
+}
+
+/* Choose the same relative lift for q and -q. At exactly pi the nearest lift
+ * is tied: a lexicographic sign for both quaternions preserves prior-sign
+ * equivariance as well as observation-sign invariance, without an epsilon. */
+static int pose_observation_sign(const LinmathQuat q, const LinmathQuat prior) {
+	FLT dot = 0;
+	for (int i = 0; i < 4; i++) dot += q[i] * prior[i];
+	if (dot > 0) return 1;
+	if (dot < 0) return -1;
+	int qsign = 1, psign = 1;
+	for (int i = 0; i < 4; i++) if (q[i] != 0) { qsign = q[i] < 0 ? -1 : 1; break; }
+	for (int i = 0; i < 4; i++) if (prior[i] != 0) { psign = prior[i] < 0 ? -1 : 1; break; }
+	return qsign * psign;
+}
+
 void survive_kalman_tracker_integrate_observation(PoserData *pd, SurviveKalmanTracker *tracker, const SurvivePose *pose,
 												  const struct CnMat *Ri) {
 	SurviveObject *so = tracker->so;
     SurviveContext *ctx = so->ctx;
+
+	if (!pose_observation_valid(pose, Ri)) {
+		SV_WARN("Ignoring malformed pose observation for %s", so->codename);
+		return;
+	}
+
+	/* Quaternion double cover is a coordinate change, not a physical correction.
+	 * Transform the FULL covariance D Ri D^T, including position/quaternion
+	 * cross terms, before variance augmentation and every pose consumer. The
+	 * existing diagonal augmentation commutes with D (D_i^2 == 1). Within a
+	 * selected branch the lift is constant; the native state Jacobians are
+	 * unchanged. Never mutate the caller's pose or covariance. */
+	SurvivePose lifted_pose;
+	FLT lifted_covariance[49];
+	CnMat lifted_R = cnMat(7, 7, lifted_covariance);
+	if (pose_observation_sign(pose->Rot, tracker->state.Pose.Rot) < 0) {
+		lifted_pose = *pose;
+		for (int i = 0; i < 4; i++) lifted_pose.Rot[i] = -lifted_pose.Rot[i];
+		pose = &lifted_pose;
+		if (Ri) {
+			for (int r = 0; r < 7; r++) for (int c = 0; c < 7; c++)
+				cnMatrixSet(&lifted_R, r, c, cnMatrixGet(Ri, r, c) * ((r < 3) == (c < 3) ? 1 : -1));
+			Ri = &lifted_R;
+		}
+	}
 
 	integrate_variance_tracker(tracker, &tracker->pose_variance, (FLT*)pose->Pos, 7);
 
@@ -1239,6 +1340,7 @@ void survive_kalman_tracker_integrate_observation(PoserData *pd, SurviveKalmanTr
         }
 
         FLT obs_error = integrate_pose(tracker, time, pose, tracker->obs_model.adaptive ? 0 : &R);
+		record_optical_result(tracker, obs_error, pd->pt);
 		tracker->stats.obs_total_error += obs_error;
 		tracker->stats.obs_count++;
 
@@ -1252,6 +1354,7 @@ void survive_kalman_tracker_integrate_observation(PoserData *pd, SurviveKalmanTr
 typedef void (*survive_attach_detach_fn)(SurviveContext *ctx, const char *tag, FLT *var);
 
 void survive_kalman_tracker_reinit(SurviveKalmanTracker *tracker) {
+	tracker->reinit_count++;
 	memset(&tracker->stats, 0, sizeof(tracker->stats));
 
 	tracker->report_ignore_start_cnt = 0;
