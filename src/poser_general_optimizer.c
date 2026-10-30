@@ -3,6 +3,7 @@
 #include "survive_internal.h"
 
 #include <assert.h>
+#include <math.h>
 #if !defined(__FreeBSD__) && !defined(__APPLE__)
 #include <malloc.h>
 #endif
@@ -51,7 +52,21 @@ void general_optimizer_data_record_failure(GeneralOptimizerData *d) {
 bool general_optimizer_data_record_success(GeneralOptimizerData *d, FLT error, const SurvivePose *pose, bool isCal) {
 	FLT max_error = isCal ? d->max_cal_error : d->max_error;
 	d->stats.runs++;
-	if (max_error <= 0 || max_error > error) {
+	/* A converged optimizer can still return malformed numeric state. Never
+	 * refresh lastSuccess with it: the recent-success cache would otherwise
+	 * seed the same invalid pose on every subsequent optical solve. */
+	bool valid = isfinite(error);
+	if (pose) {
+		for (int i = 0; i < 3; i++)
+			valid &= isfinite(pose->Pos[i]);
+		for (int i = 0; i < 4; i++)
+			valid &= isfinite(pose->Rot[i]);
+		FLT rotation_norm = 0;
+		for (int i = 0; i < 4; i++)
+			rotation_norm += pose->Rot[i] * pose->Rot[i];
+		valid &= isfinite(rotation_norm) && rotation_norm > 0;
+	}
+	if (valid && (max_error <= 0 || max_error > error)) {
 		if (d->successes_to_reset_cntr > 0)
 			d->successes_to_reset_cntr--;
 		if (pose) {
