@@ -34,19 +34,47 @@ STATIC_CONFIG_ITEM(OOTX_UP_TOLERANCE, "ootx-up-tolerance-deg", 'f', "Saved stati
 
 static bool ootx_room_up_changed(SurviveContext *ctx, BaseStationData *b, const FLT *accel) {
 	char key[64];
+	char invalid_key[64];
 	snprintf(key, sizeof(key), "room-tilt-blocked-%08x", (unsigned)b->BaseStationID);
+	snprintf(invalid_key, sizeof(invalid_key), "room-tilt-invalid-%08x", (unsigned)b->BaseStationID);
 	/* A moved station stays blocked, including across reconnects. Only a new
 	 * explicit room fit may clear this latch; returning inside tolerance cannot. */
 	if (survive_configf(ctx, key, SC_GET, 0) > 0) return true;
+	/* The explicit policy affects only gravity diagnostics. Existing unresolved
+	 * exclusions remain authoritative; optical and identity checks are unchanged. */
+	if (survive_configi(ctx, "ootx-up-warning-only", SC_GET, 1)) {
+		/* A healthy payload resumes only our transient hold. Gravity is diagnostic
+		 * under this policy; unresolved durable exclusions were checked above. */
+		if (survive_configi(ctx, invalid_key, SC_GET, 0)) {
+			b->PositionSet = 1;
+			survive_configi(ctx, invalid_key, SC_SET | SC_OVERRIDE, 0);
+		}
+		return false;
+	}
 	FLT tolerance = survive_configf(ctx, OOTX_UP_TOLERANCE_TAG, SC_GET, 0.5);
 	if (!isfinite(tolerance) || tolerance < 0 || tolerance > 180) tolerance = 0.5;
-	FLT a = norm3d(b->accel), n = norm3d(accel), angle = 180;
-	if (isfinite(a) && isfinite(n) && a > 0 && n > 0) {
-		FLT cosine = 0;
-		for (int i = 0; i < 3; i++) cosine += (b->accel[i] / a) * (accel[i] / n);
-		angle = acos(fmax(-1, fmin(1, cosine))) * 180 / acos(-1);
+	FLT a = norm3d(b->accel), n = accel ? norm3d(accel) : 0;
+	if (!isfinite(a) || !isfinite(n) || a <= 0 || n <= 0) {
+		/* Invalid OOTX gravity is not a physical movement measurement. Withhold
+		 * this station until a valid packet can check the saved room reference. */
+		if (b->PositionSet) {
+			SV_WARN("Station gravity invalid: station=%08x; room pose temporarily withheld",
+				(unsigned)b->BaseStationID);
+			survive_configi(ctx, invalid_key, SC_SET | SC_OVERRIDE, 1);
+		}
+		b->PositionSet = 0;
+		return false;
 	}
-	if (isfinite(a) && isfinite(n) && a > 0 && n > 0 && angle <= tolerance + 1e-9) return false;
+	FLT cosine = 0;
+	for (int i = 0; i < 3; i++) cosine += (b->accel[i] / a) * (accel[i] / n);
+	FLT angle = acos(fmax(-1, fmin(1, cosine))) * 180 / acos(-1);
+	if (angle <= tolerance + 1e-9) {
+		if (survive_configi(ctx, invalid_key, SC_GET, 0)) {
+			b->PositionSet = 1;
+			survive_configi(ctx, invalid_key, SC_SET | SC_OVERRIDE, 0);
+		}
+		return false;
+	}
 	survive_configf(ctx, key, SC_SETCONFIG | SC_OVERRIDE, angle);
 	SV_WARN("Station tilt exceeded: station=%08x change=%.6f tolerance=%.6f; saved room pose blocked",
 		(unsigned)b->BaseStationID, (double)angle, (double)tolerance);
