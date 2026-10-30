@@ -95,6 +95,7 @@ typedef struct MPFITData {
   FLT sensor_variance_cal;
   bool model_velocity;
   bool globalDataAvailable;
+  FLT awaiting_overlap_log_time;
   struct survive_async_optimizer *async_optimizer;
 
   survive_optimizer_settings optimizer_settings;
@@ -118,15 +119,17 @@ STRUCT_CONFIG_ITEM("mpfit-lighthouse-up-variance",
 END_STRUCT_CONFIG_SECTION(MPFITData)
 
 static size_t remove_lh_from_meas(survive_optimizer *mpfitctx, int lh) {
-	size_t rtn = mpfitctx->measurementsCnt;
-	survive_optimizer_measurement *meas = mpfitctx->measurements;
-	for (int i = 0; i < rtn; i++) {
-		while (meas[i].meas_type == survive_optimizer_measurement_type_light && meas[i].light.lh == lh && i < rtn) {
-			meas[i] = meas[rtn - 1];
-			rtn--;
-		}
+	/* Only the active prefix is consumed by the optimizer. Commit its length
+	 * after exclusion, preserving the order of every retained constraint. */
+	size_t kept = 0;
+	for (size_t i = 0; i < mpfitctx->measurementsCnt; i++) {
+		survive_optimizer_measurement *meas = &mpfitctx->measurements[i];
+		if (meas->meas_type == survive_optimizer_measurement_type_light && meas->light.lh == lh)
+			continue;
+		mpfitctx->measurements[kept++] = *meas;
 	}
-	return rtn;
+	mpfitctx->measurementsCnt = kept;
+	return kept;
 }
 
 struct async_optimizer_user {
@@ -300,6 +303,56 @@ static inline int get_lh_count(const size_t *meas_for_lhs_axis) {
 	return num_lh;
 }
 
+/* Survey-only seed frame conversion. Established geometry is never a seed output. */
+struct survey_seed_context { SurvivePose object; SurvivePose *cameras; bool received; };
+static bool survey_seed_rigid(const SurvivePose *pose) {
+	FLT q = 0;
+	for (int i = 0; i < 3; i++) if (!isfinite(pose->Pos[i])) return false;
+	for (int i = 0; i < 4; i++) { if (!isfinite(pose->Rot[i])) return false; q += pose->Rot[i] * pose->Rot[i]; }
+	return isfinite(q) && fabs(q - 1) <= DEFAULT_EPSILON;
+}
+static void survey_seed_ignore_pose(SurviveObject *so, uint32_t tick, const SurvivePose *pose, void *user) { }
+static void survey_seed_camera(SurviveObject *so, uint8_t lh, SurvivePose *camera, SurvivePose *object, void *user) {
+	struct survey_seed_context *seed = user;
+	if (lh >= so->ctx->activeLighthouses || so->ctx->bsd[lh].PositionSet || !object ||
+		!survey_seed_rigid(&seed->object) || !survey_seed_rigid(object) || !survey_seed_rigid(camera)) return;
+	SurvivePose inverse = InvertPoseRtn(object), frame, aligned;
+	ApplyPoseToPose(&frame, &seed->object, &inverse);
+	ApplyPoseToPose(&aligned, &frame, camera);
+	if (!survey_seed_rigid(&aligned)) return;
+	seed->cameras[lh] = aligned; seed->received = true;
+}
+static bool survey_seed_cameras(MPFITData *d, PoserDataLight *light, SurvivePose *cameras, const SurvivePose *object) {
+	if (!d->opt.seed_poser || !survey_seed_rigid(object)) return false;
+	size_t size = PoserData_size(&light->hdr); uint8_t *event = alloca(size); memcpy(event, light, size);
+	PoserDataLight *copy = (PoserDataLight *)event;
+	struct survey_seed_context seed = {.object = *object, .cameras = cameras};
+	copy->hdr.poseproc = survey_seed_ignore_pose; copy->hdr.lighthouseposeproc = survey_seed_camera;
+	copy->hdr.userdata = &seed; copy->assume_current_pose = true;
+	d->opt.seed_poser(d->opt.so, &copy->hdr); d->opt.stats.poser_seed_runs++;
+	return seed.received;
+}
+static void survey_await_overlap(MPFITData *d, const SurviveSensorActivations *scene, const char *reason) {
+	SurviveContext *ctx = d->opt.so->ctx;
+	if (survive_configi(ctx, "disable-calibrate", SC_GET, 0) != 0) return;
+	bool pending = false;
+	for (int lh = 0; lh < ctx->activeLighthouses; lh++) pending |= !ctx->bsd[lh].PositionSet && !ctx->bsd[lh].disable && d->disable_lighthouse != lh;
+	if (!pending) return;
+	FLT now = survive_run_time(ctx);
+	if (d->awaiting_overlap_log_time > 0 && now - d->awaiting_overlap_log_time < 1) return;
+	d->awaiting_overlap_log_time = now;
+	SV_INFO("awaiting-overlap reason=%s; established frame retained; retry=next-optical-sync", reason);
+	bool stationary = SurviveSensorActivations_stationary_time(scene) > d->opt.so->timebase_hz;
+	survive_timecode window = stationary && d->useStationaryWindow ? d->opt.so->timebase_hz : d->sensor_time_window;
+	for (int lh = 0; lh < ctx->activeLighthouses; lh++) {
+		size_t axes[2] = {0};
+		if (!ctx->bsd[lh].disable && d->disable_lighthouse != lh)
+			for (int sensor = 0; sensor < d->opt.so->sensor_ct; sensor++) for (int axis = 0; axis < 2; axis++)
+				axes[axis] += SurviveSensorActivations_time_since_last_reading(scene, sensor, lh, axis) < window;
+		SV_INFO("awaiting-overlap station=LHB-%X index=%d established=%d ootx=%d enabled=%d raw-axis0=%zu raw-axis1=%zu required-known=%d both-axes-required=1 candidate-minimum=10", (unsigned)ctx->bsd[lh].BaseStationID, lh, ctx->bsd[lh].PositionSet, ctx->bsd[lh].OOTXSet, !ctx->bsd[lh].disable && d->disable_lighthouse != lh, axes[0], axes[1], d->required_meas);
+	}
+}
+
 static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer *mpfitctx,
 						   SurviveSensorActivations *scene) {
 	MPFITData *d = user->d;
@@ -311,11 +364,24 @@ static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer 
 
 	SurvivePose *soLocation = survive_optimizer_get_pose(mpfitctx);
 	survive_optimizer_setup_cameras(mpfitctx, so->ctx, true, d->use_jacobian_function_lh, false);
+	bool surveyMode = survive_configi(ctx, "disable-calibrate", SC_GET, 0) == 0;
+	if (surveyMode) {
+		/* PositionSet is the authority in survey mode. A cached pose for an
+		 * unpositioned station must not remain as a fixed optimizer parameter:
+		 * MPFIT validates fixed parameters too, so an unrelated stale pose can
+		 * reject an otherwise observable first-world solve before iteration. */
+		SurvivePose identity = {.Rot = {1}};
+		for (int lh = 0; lh < ctx->activeLighthouses; lh++) {
+			if (!ctx->bsd[lh].PositionSet)
+				survive_optimizer_setup_camera(mpfitctx, lh, &identity, true, d->use_jacobian_function_lh);
+		}
+	}
 	bool objectStationary = SurviveSensorActivations_stationary_time(&so->activations) > 3 * so->timebase_hz;
 
 	bool worldEstablished = false;
 	for (int lh = 0; lh < ctx->activeLighthouses && !worldEstablished; lh++)
 		worldEstablished |= ctx->bsd[lh].PositionSet;
+	bool surveyIncremental = surveyMode && worldEstablished;
 
 	survive_optimizer_setup_pose(mpfitctx, 0, !worldEstablished, d->use_jacobian_function_obj);
 	SurviveVelocity *velocity = survive_optimizer_get_velocity(mpfitctx);
@@ -330,6 +396,7 @@ static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer 
 	bool currentPositionValid = quatmagnitude(soLocation->Rot) != 0;
 
 	if (worldEstablished && !general_optimizer_data_record_current_pose(&d->opt, pdl, soLocation)) {
+		survey_await_overlap(d, scene, "known-anchor-seed-unavailable");
 		return -1;
 	}
 
@@ -350,6 +417,7 @@ static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer 
 	size_t meas_size = construct_input_from_scene(d, pdl->hdr.timecode, scene, meas_for_lhs_axis, mpfitctx, user);
 
 	if (worldEstablished && invalid_starting_condition(d, meas_size, meas_for_lhs_axis)) {
+		survey_await_overlap(d, scene, "insufficient-known-anchor-constraints");
 		return -1;
 	}
 
@@ -366,7 +434,17 @@ static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer 
 	// This just spaces out the controllers; forces an order onto what trys to calibrate what
 	int syncs_required = 200 - so->sensor_ct * 2 - (so->codename[2] - '0') * 10;
 
-	if (bestObjForCal || (d->syncs_seen > syncs_required && objectStationary)) {
+	if (surveyIncremental && worldEstablished) {
+		/* Only observed, factory-calibrated unknown stations are candidates.
+		 * An unrelated absent/OOTX-incomplete station cannot veto overlap. */
+		if (objectStationary && !d->globalDataAvailable && (bestObjForCal || d->syncs_seen > syncs_required)) {
+			for (int lh = 0; lh < ctx->activeLighthouses; lh++) {
+				if (!ctx->bsd[lh].PositionSet && ctx->bsd[lh].OOTXSet && has_data_for_lh(meas_for_lhs_axis, lh)) {
+					canPossiblySolveLHS = true; needsInitialEstimate = true;
+				}
+			}
+		}
+	} else if (bestObjForCal || (d->syncs_seen > syncs_required && objectStationary)) {
 		for (int lh = 0; lh < so->ctx->activeLighthouses; lh++) {
 			if (!so->ctx->bsd[lh].OOTXSet) {
 				// Wait til this thing gets OOTX, and then solve for as much as we can. Avoids doing
@@ -387,7 +465,7 @@ static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer 
 
 	SurvivePose lhs[NUM_GEN2_LIGHTHOUSES] = {0};
 	if (canPossiblySolveLHS) {
-		if (!needsInitialEstimate || general_optimizer_data_record_current_lhs(&d->opt, pdl, lhs)) {
+		if (!needsInitialEstimate || ((surveyIncremental && worldEstablished) ? survey_seed_cameras(d, pdl, lhs, soLocation) : general_optimizer_data_record_current_lhs(&d->opt, pdl, lhs))) {
 			uint32_t reference_basestation = survive_configi(ctx, "reference-basestation", SC_GET, 0);
 
 			for (int lh = 0; lh < so->ctx->activeLighthouses; lh++) {
@@ -415,6 +493,9 @@ static int setup_optimizer(struct async_optimizer_user *user, survive_optimizer 
 		}
 	}
 
+	if (surveyIncremental && worldEstablished && !canPossiblySolveLHS)
+		survey_await_overlap(d, scene, d->globalDataAvailable ? "global-scene-owner" :
+			(objectStationary ? "no-observable-candidate-or-seed" : "tracker-not-stationary"));
 	size_t skipped_lh_cnt = 0;
 	for (int lh = 0; lh < so->ctx->activeLighthouses; lh++) {
 		survive_optimizer_set_cam_up_vector(mpfitctx, lh, d->lh_up_variance, ctx->bsd[lh].accel);
@@ -547,7 +628,8 @@ static FLT handle_optimizer_results(survive_optimizer *mpfitctx, int res, const 
 			FLT variances[NUM_GEN2_LIGHTHOUSES] = {0};
 
 			for (int i = 0; i < mpfitctx->cameraLength; i++) {
-				if (has_data_for_lh(meas_for_lhs_axis, i) > 0 && !quatiszero(opt_cameras[i].Rot)) {
+				if (has_data_for_lh(meas_for_lhs_axis, i) > 0 && !quatiszero(opt_cameras[i].Rot) &&
+					!(worldEstablished && survive_configi(ctx, "disable-calibrate", SC_GET, 0) == 0 && ctx->bsd[i].PositionSet)) {
 					cameras[i] = InvertPoseRtn(&opt_cameras[i]);
 				}
 				for (int axis = 0; axis < 2; axis++) {
@@ -638,7 +720,13 @@ static FLT handle_optimizer_results(survive_optimizer *mpfitctx, int res, const 
 		if (canPossiblySolveLHS && d->opt.failures_since_success > 10 && d->opt.stats.successes < 10 &&
 			(SurviveSensorActivations_stationary_time(&so->activations) > (48000000 / 10))) {
 			SV_WARN("Tracker lost for %s", so->codename);
-			survive_kalman_tracker_lost_tracking(so->tracker, true);
+			if (survive_configi(ctx, "disable-calibrate", SC_GET, 0) == 0) {
+				/* A survey rejection is not authority to destroy its coordinate
+				 * epoch. Keep every PositionSet flag and retry as overlap changes. */
+				survey_await_overlap(d, &so->activations, "optimizer-rejected-retaining-epoch");
+			} else {
+				survive_kalman_tracker_lost_tracking(so->tracker, true);
+			}
 		}
 	}
 
